@@ -4,20 +4,26 @@ from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 import os
 import datetime
+from datetime import date
 import logging
-import sys
 import json
+import base64
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from apiclient import errors
+
 
 SCOPES = [
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/spreadsheets.readonly"
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/contacts.readonly"
 ]
 CREDENTIALS_FILE = "./secrets/credentials.json"
 TOKEN_FILE = "./secrets/token.json"
+TODAY = date.today()
+TODAY_YEAR = date.today().year
 
-
-with open("./secrets/birthday.json", "r") as fi:
-    BIRTHDAY = json.loads(fi.read())
+with open("./secrets/config.json", "r") as fi:
+    CONFIG = json.loads(fi.read())
 
 
 LOGGER = logging.getLogger(__name__)
@@ -25,9 +31,6 @@ logging.basicConfig(level=logging.INFO)
 
 
 def get_creds():
-    """Shows basic usage of the Google Calendar API.
-    Prints the start and name of the next 10 events on the user's calendar.
-    """
     LOGGER.info("Reading Token file f{TOKEN_FILE}")
     creds = None
     if os.path.exists(TOKEN_FILE):
@@ -50,98 +53,80 @@ def get_creds():
     return creds
 
 
-def get_birthday_id(service):
-    LOGGER.info("Getting birthday calendar ID")
-    all_calendars = service.calendarList().list(pageToken=None).execute()
-    id = None
-    for i in all_calendars["items"]:
-        if i["summary"] == "Birthdays (Real)":
-            id = i["id"]
-    if id is None:
-        LOGGER.error("Unable to find Birthday Calendar ID")
-        sys.exit(2)
+def get_rtm_string(contact):
+    STRING = "{name} #Birthdays *every year ^{day}/{month}/{year}"
+    birthdays = contact.get("birthdays", [])
+    if not birthdays:
+        return None
+    d = birthdays[0]["date"]
+    if datetime.date(TODAY_YEAR, d["month"], d["day"]) < TODAY:
+        year = TODAY_YEAR + 1
     else:
-        LOGGER.info(f"Birthday Calendar ID is {id}")
-    return id
+        year = TODAY_YEAR
+    return STRING.format(
+        name=contact["names"][0]["displayName"],
+        day=d["day"],
+        month=d["month"],
+        year=year
+    )
 
 
-def get_existing_events(service, id):
-    LOGGER.info(f"Getting events for calendar: {id}")
-    events_result = service.events().list(
-        calendarId=id,
-        maxResults=2500,
-        singleEvents=False,
-        timeMin="2019-01-03T10:00:00-00:00"
+def chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def get_contacts(service):
+    LOGGER.info("Getting contacts")
+    results = service.people().connections().list(
+        resourceName="people/me",
+        pageSize=1000,
+        personFields='names,birthdays'
     ).execute()
-    nextpagetoken = events_result.get("nextPageToken")
-    if nextpagetoken:
-        LOGGER.error("TODO - Implement page tokens")
-        sys.exit(2)
-    events = events_result.get('items', [])
-    LOGGER.info(f"Found {len(events)} existing calender events")
-    return events
+    connections = results.get('connections', [])
+    LOGGER.info(f"Got {len(connections)} contacts")
+    return connections
 
 
-def delete_existing_events(service, id, events):
-    LOGGER.info(f"Attempting to delete {len(events)} events")
-    batch = service.new_batch_http_request()
-    for event in events:
-        batch.add(
-            service.events().delete(calendarId=id, eventId=event['id'])
-        )
-    batch.execute()
-    LOGGER.info("All events deleted!")
+def get_chunked_strings(connections, chunk_size=30):
+    strings_with_null = [get_rtm_string(i) for i in connections]
+    strings = [i for i in strings_with_null if i]
+    strings_chunked = list(chunks(strings, chunk_size))
+    LOGGER.info(f"Reduced to {len(strings)} contacts with birthdays")
+    return strings_chunked
 
 
-def get_birthday_data(service):
-    LOGGER.info("Getting Birthday Spreadsheet data")
-    sheet = service.spreadsheets()
-    result = sheet.values().get(
-        spreadsheetId=BIRTHDAY["BIRTHDAY_SHEET_ID"],
-        range=BIRTHDAY["BIRTHDAY_DATA_RANGE"]
-    ).execute()
-    values = result.get('values', [])
-    LOGGER.info(f"Got {len(values)} birthdays from gsheets")
-    return values
+def SendMessageInternal(service, message):
+    LOGGER.info("Sending Email")
+    try:
+        message = service.users().messages().send(
+            userId="me",
+            body=message
+        ).execute()
+        return message
+    except errors.HttpError as error:
+        print('An error occurred: %s' % error)
 
 
-def create_calendar_events(service, birthday_data):
-    LOGGER.info(f"Attempting to create {len(birthday_data)} new events")
-    now = datetime.datetime.now().year
-    event_template = {
-        'summary': 'TESTING CALENDER',
-        'start': {
-            'date': '',
-            'timeZone': 'Europe/London',
-        },
-        'end': {
-            'date': '',
-            'timeZone': 'Europe/London',
-        },
-        "recurrence": ["RRULE:FREQ=YEARLY"]
-    }
-    batch = service.new_batch_http_request()
-    for person in birthday_data:
-        date = f"{now}-{person[2]}-{person[1]}"
-        event_template["summary"] = person[0]
-        event_template["start"]["date"] = date
-        event_template["end"]["date"] = date
-        batch.add(
-            service.events().insert(calendarId=id, body=event_template)
-        )
-    batch.execute()
-    LOGGER.info("All events created!")
+def CreateMessage(content):
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = "Import Me"
+    msg['From'] = CONFIG["email_me"]
+    msg['To'] = CONFIG["email_rtm"]
+    msg.attach(MIMEText(content, 'plain'))
+    raw = base64.urlsafe_b64encode(msg.as_bytes())
+    raw = raw.decode()
+    body = {'raw': raw}
+    return body
 
 
 if __name__ == "__main__":
-    
     creds = get_creds()
-    service_cal = build('calendar', 'v3', credentials=creds)
-    service_sheets = build('sheets', 'v4', credentials=creds)
-    
-    id = get_birthday_id(service_cal)
-    events = get_existing_events(service_cal, id)
-    delete_existing_events(service_cal, id, events)
-    
-    birthday_data = get_birthday_data(service_sheets)
-    create_calendar_events(service_cal, birthday_data)
+    service_cal = build('people', 'v1', credentials=creds)
+    service_mail = build('gmail', 'v1', credentials=creds)
+    connections = get_contacts(service_cal)
+    strings = get_chunked_strings(connections)
+    messages = [CreateMessage("\n".join(i)) for i in strings]
+    for message in messages:
+        SendMessageInternal(service_mail, message)

@@ -1,10 +1,19 @@
 # BirthdaySync
 
-Small project to contain code to syncronise my birthday calanders across different tools
+Small project to pull my contacts birthdays from Google contacts and post recurring reminders to Remember the Milk
 
 
-## TODO
+## Dependencies
 
-- [] Add birthdays to contacts
-- [] Update code to pull birthdays from contacts
-- [] Update code to email birthdays to RTM
+```
+python3 -m pip install -r requirements.txt
+```
+
+or from scratch
+
+```
+python3 -m pip install google-auth-oauthlib
+python3 -m pip install google-api-python-client
+```
+
+
